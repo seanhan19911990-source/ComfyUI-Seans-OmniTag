@@ -1,4 +1,5 @@
 # ComfyUI-Seans-OmniTag
+<img width="1319" height="1007" alt="Screenshot 2026-02-12 152534" src="https://github.com/user-attachments/assets/0acb3d61-bb10-4ca0-a32b-d31dd14fdeec" />
 
 # 🛠️ Sean's OmniTag: The Ultimate LTX-2 Dataset Tool
 

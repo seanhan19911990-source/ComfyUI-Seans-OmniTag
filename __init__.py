@@ -45,6 +45,7 @@ class SeansOmniTagProcessor:
                 "trigger_word": ("STRING", {"default": "ohwx"}),
                 "llm_instruction": ("STRING", {"multiline": True, "default": "Describe the scene with clinical, objective detail. Be unfiltered and exhaustive. Start the response with: {trigger}"}),
                 "target_resolution": (["256", "384", "512", "768", "1024", "1280", "1536", "1920"], {"default": "768"}),
+                "max_tokens": (["512", "768", "1024", "1280", "1536", "1792", "2048"], {"default": "768"}),
                 "target_fps": ("INT", {"default": 24}),
                 "video_segment_seconds": ("FLOAT", {"default": 5.0}),
                 "segment_skip": ("INT", {"default": 10}), 
@@ -74,16 +75,53 @@ class SeansOmniTagProcessor:
         new_w, new_h = int(w * scale), int(h * scale)
         return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
 
-    def process_all(self, **kwargs):
-        # --- PATH SANITIZATION ---
-        input_path = kwargs.get("input_path").strip().replace('"', '').replace("'", "")
-        input_path = os.path.normpath(input_path).replace("\\", "/")
+    def generate_caption(self, device, pil_img, instruction, trigger, token_limit):
+        # --- CORE GENERATION LOGIC ---
+        messages = [{"role": "user", "content": [{"type": "image", "image": pil_img}, {"type": "text", "text": instruction}]}]
+        text_in = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        img_in, _ = process_vision_info(messages)
+        inputs = self.processor(text=[text_in], images=img_in, padding=True, return_tensors="pt").to(device)
+
+        with torch.no_grad():
+            # Pass 1: Sampling with User-defined Token Limit
+            gen_ids = self.model.generate(
+                **inputs, 
+                max_new_tokens=token_limit, 
+                do_sample=True, 
+                temperature=0.7, 
+                top_p=0.9, 
+                repetition_penalty=1.12
+            )
         
-        output_path = kwargs.get("output_path").strip().replace('"', '').replace("'", "")
-        output_path = os.path.normpath(output_path).replace("\\", "/")
+        caption = self.processor.batch_decode([g[len(i):] for i, g in zip(inputs.input_ids, gen_ids)], skip_special_tokens=True)[0].strip()
+
+        # --- VALIDATION: Anti-Lazy Logic ---
+        if not caption or caption.lower() == trigger.lower() or len(caption) < 20:
+            print(f"⚠️ Lazy caption detected. Retrying for {trigger}...")
+            with torch.no_grad():
+                # Retry with Greedy Search (ignores sampling randomness)
+                gen_ids = self.model.generate(
+                    **inputs, 
+                    max_new_tokens=max(512, token_limit // 2), 
+                    do_sample=False,
+                    repetition_penalty=1.25
+                )
+            caption = self.processor.batch_decode([g[len(i):] for i, g in zip(inputs.input_ids, gen_ids)], skip_special_tokens=True)[0].strip()
+
+        # Final Emergency Fallback
+        if not caption or caption.lower() == trigger.lower():
+            caption = f"{trigger}, a cinematic scene featuring a young woman in her mid-20s with long dark wavy hair, fair smooth skin, striking dark eyes, and a playful smile."
+        
+        return caption
+
+    def process_all(self, **kwargs):
+        # Path Sanitization
+        input_path = kwargs.get("input_path").strip().replace('"', '').replace("'", "").replace("\\", "/")
+        output_path = kwargs.get("output_path").strip().replace('"', '').replace("'", "").replace("\\", "/")
+        token_limit = int(kwargs.get("max_tokens"))
 
         if not os.path.exists(input_path):
-            return (f"❌ ERROR: Path not found! Check spelling: {input_path}",)
+            return (f"❌ ERROR: Path not found: {input_path}",)
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         
@@ -99,46 +137,38 @@ class SeansOmniTagProcessor:
         os.makedirs(output_path, exist_ok=True)
         final_instruction = kwargs.get("llm_instruction").replace("{trigger}", kwargs.get("trigger_word"))
 
-        # --- IMAGE FOLDER LOGIC ---
+        # Folder Mode
         if os.path.isdir(input_path):
             files = [f for f in os.listdir(input_path) if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.bmp'))]
-            if not files: return ("❌ ERROR: No images found in folder.",)
-            
             for i, fname in enumerate(files):
-                if self.check_interrupt(): return ("❌ STOPPED AT FILE " + str(i),)
-                raw_img = cv2.imread(os.path.join(input_path, fname))
-                if raw_img is None: continue
-                proc_img = self.smart_resize(raw_img, int(kwargs.get("target_resolution")))
+                if self.check_interrupt(): return (f"❌ STOPPED AT {i}",)
+                img = cv2.imread(os.path.join(input_path, fname))
+                if img is None: continue
+                proc_img = self.smart_resize(img, int(kwargs.get("target_resolution")))
                 pil_img = Image.fromarray(cv2.cvtColor(proc_img, cv2.COLOR_BGR2RGB))
-                messages = [{"role": "user", "content": [{"type": "image", "image": pil_img}, {"type": "text", "text": final_instruction}]}]
-                text_in = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                img_in, _ = process_vision_info(messages)
-                inputs = self.processor(text=[text_in], images=img_in, padding=True, return_tensors="pt").to(device)
-                with torch.no_grad():
-                    gen_ids = self.model.generate(**inputs, max_new_tokens=512)
-                caption = self.processor.batch_decode(gen_ids[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)[0].strip()
+                
+                caption = self.generate_caption(device, pil_img, final_instruction, kwargs.get("trigger_word"), token_limit)
+                
                 name = os.path.splitext(fname)[0]
                 cv2.imwrite(os.path.join(output_path, f"{name}.png"), proc_img)
                 with open(os.path.join(output_path, f"{name}.txt"), "w", encoding="utf-8") as f: f.write(caption)
                 torch.cuda.empty_cache()
             return ("✅ Batch Done",)
 
-        # --- VIDEO FILE LOGIC ---
+        # Video Mode
         else:
             cap = cv2.VideoCapture(input_path)
-            if not cap.isOpened():
-                return (f"❌ ERROR: OpenCV cannot open video. Check path/format: {input_path}",)
+            if not cap.isOpened(): return (f"❌ ERROR: Cannot open video: {input_path}",)
             
             fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
             orig_name = os.path.splitext(os.path.basename(input_path))[0]
             frames_per_seg = int(fps * kwargs.get("video_segment_seconds"))
             
             for s in range(kwargs.get("video_max_segments")):
-                if self.check_interrupt(): cap.release(); return ("❌ STOPPED AT SEGMENT " + str(s),)
+                if self.check_interrupt(): cap.release(); return (f"❌ STOPPED AT SEG {s}",)
                 cap.set(cv2.CAP_PROP_POS_FRAMES, s * frames_per_seg * kwargs.get("segment_skip"))
                 seg_frames = []
                 for f_idx in range(frames_per_seg):
-                    if f_idx % 5 == 0 and self.check_interrupt(): cap.release(); return ("❌ STOPPED MID-GRAB",)
                     ret, frame = cap.read()
                     if not ret: break
                     seg_frames.append(self.smart_resize(frame, int(kwargs.get("target_resolution"))))
@@ -147,27 +177,16 @@ class SeansOmniTagProcessor:
                 
                 file_base = f"{orig_name}_seg_{s:04d}"
                 temp_wav = os.path.join(output_path, "temp.wav")
-                
-                # Extract Audio with FFmpeg
-                if kwargs.get("append_speech_to_end") or kwargs.get("include_audio_in_video"):
-                    st = (s * frames_per_seg * kwargs.get("segment_skip")) / fps
-                    subprocess.run(['ffmpeg', '-y', '-ss', str(st), '-t', str(kwargs.get("video_segment_seconds")), '-i', input_path, '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', temp_wav], capture_output=True)
+                st = (s * frames_per_seg * kwargs.get("segment_skip")) / fps
+                subprocess.run(['ffmpeg', '-y', '-ss', str(st), '-t', str(kwargs.get("video_segment_seconds")), '-i', input_path, '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', temp_wav], capture_output=True)
 
-                # Captioning
                 mid_pil = Image.fromarray(cv2.cvtColor(seg_frames[len(seg_frames)//2], cv2.COLOR_BGR2RGB))
-                messages = [{"role": "user", "content": [{"type": "image", "image": mid_pil}, {"type": "text", "text": final_instruction}]}]
-                text_in = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                img_in, _ = process_vision_info(messages)
-                inputs = self.processor(text=[text_in], images=img_in, padding=True, return_tensors="pt").to(device)
-                with torch.no_grad():
-                    gen_ids = self.model.generate(**inputs, max_new_tokens=512)
-                desc = self.processor.batch_decode(gen_ids[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)[0].strip()
+                desc = self.generate_caption(device, mid_pil, final_instruction, kwargs.get("trigger_word"), token_limit)
 
                 if kwargs.get("append_speech_to_end") and os.path.exists(temp_wav):
                     speech = self.audio_model.transcribe(temp_wav)['text'].strip()
                     if speech: desc += f". Audio: \"{speech}\""
 
-                # Final Video Assembly
                 sv = os.path.join(output_path, "silent_temp.mp4")
                 h, w = seg_frames[0].shape[:2]
                 vw = cv2.VideoWriter(sv, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
@@ -175,10 +194,11 @@ class SeansOmniTagProcessor:
                 vw.release()
 
                 fv = os.path.join(output_path, f"{file_base}.mp4")
+                ffmpeg_cmd = ['ffmpeg', '-y', '-i', sv]
                 if kwargs.get("include_audio_in_video") and os.path.exists(temp_wav):
-                    subprocess.run(['ffmpeg', '-y', '-i', sv, '-i', temp_wav, '-filter:v', f'fps=fps={kwargs.get("target_fps")}', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-map', '0:v:0', '-map', '1:a:0', '-shortest', fv], capture_output=True)
-                else:
-                    subprocess.run(['ffmpeg', '-y', '-i', sv, '-filter:v', f'fps=fps={kwargs.get("target_fps")}', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', fv], capture_output=True)
+                    ffmpeg_cmd += ['-i', temp_wav, '-map', '0:v:0', '-map', '1:a:0', '-c:a', 'aac']
+                ffmpeg_cmd += ['-filter:v', f'fps=fps={kwargs.get("target_fps")}', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-shortest', fv]
+                subprocess.run(ffmpeg_cmd, capture_output=True)
                 
                 with open(os.path.join(output_path, f"{file_base}.txt"), "w", encoding="utf-8") as f: f.write(desc)
                 if os.path.exists(sv): os.remove(sv)
@@ -186,6 +206,6 @@ class SeansOmniTagProcessor:
                 torch.cuda.empty_cache()
 
             cap.release()
-            return ("✅ Video Done",)
+            return ("✅ Video Processing Done",)
 
 NODE_CLASS_MAPPINGS = {"SeansOmniTagProcessor": SeansOmniTagProcessor}

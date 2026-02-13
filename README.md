@@ -2,6 +2,28 @@
 <img width="467" height="417" alt="image" src="https://github.com/user-attachments/assets/8f043f41-2def-42ac-b4ec-6116e217de41" />
 
 
+
+📦 Installation & Requirements
+1. Install Custom Node
+Clone this repo into your ComfyUI/custom_nodes/ folder:
+
+Bash
+git clone https://github.com/seanhan19911990-source/ComfyUI-Seans-OmniTag.git
+2. Python Dependencies (Automatic)
+The node will automatically handle the installation of transformers, whisper, and opencv on first run.
+
+3. System Requirement: FFmpeg (Manual)
+This node requires FFmpeg to be installed on your system.
+
+Windows: Download from Gyan.dev, extract, and add the bin folder to your System Environment Variables (Path).
+
+Linux: sudo apt install ffmpeg
+
+Mac: brew install ffmpeg
+
+Note: If you see ❌ ERROR: FFmpeg not found in ComfyUI, it means the node can't find the ffmpeg command in your system path.
+
+
 🛠️ Sean's OmniTag Processor
 The Ultimate All-in-One Captioning & Dataset Pipeline for ComfyUI
 Sean's OmniTag is a powerhouse node designed to eliminate the friction of building high-quality datasets. Whether you are training LTX-Video, Flux, or SDXL, this node automates the most tedious parts of the process: video segmentation, high-fidelity visual captioning, and synchronized audio transcription.
